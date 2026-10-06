@@ -1,0 +1,89 @@
+name: Android CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Test Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses & Install Components
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platform-tools" "platforms;android-36"
+
+      - name: Grant Execute Permission to Gradle Wrapper
+        run: chmod +x gradlew
+
+      - name: Configure Gradle Caching
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Check Gradle Version
+        run: ./gradlew --version
+
+      - name: Clean Build Cache
+        run: ./gradlew clean
+
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Assemble Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Verify Generated Debug APK
+        run: |
+          echo "Inspecting APK output directory:"
+          if [ -d "app/build/outputs/apk/debug" ]; then
+            ls -la app/build/outputs/apk/debug
+          else
+            echo "ERROR: Directory app/build/outputs/apk/debug does not exist!"
+            exit 1
+          fi
+
+          APK_FILE=$(find app/build/outputs/apk/debug -name "*.apk" -type f | head -n 1)
+
+          if [ -z "$APK_FILE" ]; then
+            echo "ERROR: No APK file generated!"
+            exit 1
+          fi
+
+          if [ ! -s "$APK_FILE" ]; then
+            echo "ERROR: Generated APK file is empty!"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "$APK_FILE")
+          echo "SUCCESS: Found verified APK at $APK_FILE"
+          echo "File size: $FILE_SIZE bytes"
+          echo "APK_FILE_PATH=$APK_FILE" >> $GITHUB_ENV
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutszoom-ai-debug-apk
+          path: ${{ env.APK_FILE_PATH }}
+          if-no-files-found: error
+          retention-days: 14
