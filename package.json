@@ -1,0 +1,10 @@
+{
+  "name": "cutszoom-ai-backend",
+  "version": "1.0.0",
+  "description": "Secure server-side Gemini AI analysis backend for CutsZoom AI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "private": true
+}

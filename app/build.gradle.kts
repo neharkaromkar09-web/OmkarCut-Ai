@@ -20,6 +20,9 @@ android {
     versionCode = 1
     versionName = "1.0"
 
+    buildConfigField("String", "BACKEND_URL", "\"https://ais-dev-e7x2f3oc7d7mp75fdrc34a-229730733524.asia-southeast1.run.app\"")
+    buildConfigField("String", "DEV_BACKEND_URL", "\"http://10.0.2.2:8080\"")
+
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
@@ -79,6 +82,7 @@ secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+  ignoreList.add("GEMINI_API_KEY")
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }

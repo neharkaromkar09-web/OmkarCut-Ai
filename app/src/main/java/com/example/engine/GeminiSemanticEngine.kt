@@ -4,16 +4,12 @@ import android.util.Log
 import com.example.BuildConfig
 import com.example.model.GeminiAnalysisResult
 import com.example.model.GeminiBoundaryItem
-import com.example.model.SpeechBoundary
 import com.example.model.TranscriptResult
 import com.example.model.WordTimestamp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,41 +18,21 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 @Serializable
-data class GeminiContentPart(val text: String? = null)
-
-@Serializable
-data class GeminiContent(val parts: List<GeminiContentPart>)
-
-@Serializable
-data class GeminiRequest(
-    val contents: List<GeminiContent>,
-    val generationConfig: GeminiGenerationConfig? = null,
-    val systemInstruction: GeminiContent? = null
+data class AnalyzeSpeechBackendRequest(
+    val fullText: String,
+    val words: List<WordTimestamp>,
+    val videoFps: Double,
+    val speechDurationSeconds: Double
 )
 
 @Serializable
-data class GeminiGenerationConfig(
-    val responseMimeType: String = "application/json",
-    val temperature: Float = 0.2f
-)
-
-@Serializable
-data class GeminiCandidate(val content: GeminiContent? = null)
-
-@Serializable
-data class GeminiResponse(val candidates: List<GeminiCandidate>? = null)
-
-@Serializable
-data class BoundaryJsonResponse(
-    val boundaries: List<GeminiBoundaryItem> = emptyList(),
-    val summary: String = "",
-    val speechRhythmPace: String = "Dynamic"
+data class BackendErrorResponse(
+    val error: String? = null,
+    val message: String? = null
 )
 
 object GeminiSemanticEngine {
     private const val TAG = "GeminiSemanticEngine"
-    private const val MODEL_NAME = "gemini-3.5-flash"
-    private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
     private val jsonParser = Json {
         ignoreUnknownKeys = true
@@ -64,136 +40,92 @@ object GeminiSemanticEngine {
     }
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * Sends speech transcript & timestamps to the secure backend proxy.
+     * The backend holds GEMINI_API_KEY server-side.
+     * The client APK NEVER receives or stores the API key.
+     */
     suspend fun analyzeSpeechBoundaries(
         transcriptResult: TranscriptResult,
         videoFps: Double
     ): Pair<GeminiAnalysisResult, String?> = withContext(Dispatchers.IO) {
-        val apiKey = try {
-            BuildConfig.GEMINI_API_KEY
-        } catch (e: Throwable) {
-            ""
-        }
+        val backendUrls = listOfNotNull(
+            BuildConfig.BACKEND_URL.takeIf { it.isNotBlank() },
+            BuildConfig.DEV_BACKEND_URL.takeIf { it.isNotBlank() }
+        )
 
-        // Server-side check
-        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
-            val statusMessage = "AI analysis is temporarily unavailable. Please configure the Gemini API on the server."
-            Log.w(TAG, statusMessage)
-            val fallback = generateAlgorithmicSemanticBoundaries(transcriptResult, videoFps, reasonPrefix = "Acoustic & Semantic Cadence")
-            return@withContext Pair(fallback, statusMessage)
-        }
+        val backendPayload = AnalyzeSpeechBackendRequest(
+            fullText = transcriptResult.fullText,
+            words = transcriptResult.words,
+            videoFps = videoFps,
+            speechDurationSeconds = transcriptResult.speechDurationSeconds
+        )
+        val jsonPayload = jsonParser.encodeToString(AnalyzeSpeechBackendRequest.serializer(), backendPayload)
+        val requestBody = jsonPayload.toRequestBody("application/json".toMediaType())
 
-        try {
-            val prompt = buildPrompt(transcriptResult)
-            val requestBodyObj = GeminiRequest(
-                contents = listOf(
-                    GeminiContent(parts = listOf(GeminiContentPart(text = prompt)))
-                ),
-                systemInstruction = GeminiContent(
-                    parts = listOf(
-                        GeminiContentPart(
-                            text = "You are an expert film director and AI video rhythm editor for CutsZoom AI. " +
-                                    "Analyze the speech transcript, word timestamps, pauses, and syntax. " +
-                                    "Detect natural semantic phrase/sentence boundaries where dynamic camera zoom-out (punch-out) accentuates meaning. " +
-                                    "Output strictly valid JSON conforming to the requested schema. " +
-                                    "Do NOT impose an arbitrary minimum spacing. Closely spaced natural boundaries are allowed."
+        var lastErrorMessage: String? = null
+
+        for (baseUrl in backendUrls) {
+            val endpoint = "${baseUrl.trimEnd('/')}/api/analyze-speech"
+            try {
+                val httpRequest = Request.Builder()
+                    .url(endpoint)
+                    .post(requestBody)
+                    .build()
+
+                val response = okHttpClient.newCall(httpRequest).execute()
+                val responseBody = response.body?.string()
+
+                if (response.isSuccessful && !responseBody.isNullOrBlank()) {
+                    val parsedResult = jsonParser.decodeFromString(GeminiAnalysisResult.serializer(), responseBody)
+                    val cleanBoundaries = parsedResult.boundaries.map { item ->
+                        GeminiBoundaryItem(
+                            time = (item.time * 100.0).roundToInt() / 100.0,
+                            reason = item.reason.ifBlank { "Semantic thought completion" },
+                            confidence = item.confidence.coerceIn(0.70f, 0.99f)
                         )
+                    }.sortedBy { it.time }
+
+                    val finalResult = parsedResult.copy(
+                        boundaries = cleanBoundaries,
+                        totalKeyframesSuggested = cleanBoundaries.size * 7
                     )
-                ),
-                generationConfig = GeminiGenerationConfig(
-                    responseMimeType = "application/json",
-                    temperature = 0.2f
-                )
-            )
-
-            val jsonBody = jsonParser.encodeToString(GeminiRequest.serializer(), requestBodyObj)
-            val url = "$BASE_URL/$MODEL_NAME:generateContent?key=$apiKey"
-
-            val httpRequest = Request.Builder()
-                .url(url)
-                .post(jsonBody.toRequestBody("application/json".toMediaType()))
-                .build()
-
-            val response = okHttpClient.newCall(httpRequest).execute()
-            val responseBody = response.body?.string()
-
-            if (!response.isSuccessful || responseBody.isNullOrBlank()) {
-                Log.e(TAG, "Gemini API HTTP Error ${response.code}: $responseBody")
-                val statusMessage = "AI analysis is temporarily unavailable. Please configure the Gemini API on the server."
-                val fallback = generateAlgorithmicSemanticBoundaries(transcriptResult, videoFps, reasonPrefix = "Semantic Rhythm Engine")
-                return@withContext Pair(fallback, statusMessage)
+                    return@withContext Pair(finalResult, null)
+                } else if (responseBody != null) {
+                    val errorObj = try {
+                        jsonParser.decodeFromString(BackendErrorResponse.serializer(), responseBody)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    lastErrorMessage = errorObj?.error ?: errorObj?.message ?: "HTTP ${response.code} from server."
+                    Log.w(TAG, "Backend returned error from $endpoint: $lastErrorMessage")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to connect to backend at $endpoint: ${e.message}")
+                lastErrorMessage = e.message
             }
-
-            val geminiResponse = jsonParser.decodeFromString(GeminiResponse.serializer(), responseBody)
-            val textContent = geminiResponse.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-
-            if (textContent.isNullOrBlank()) {
-                val fallback = generateAlgorithmicSemanticBoundaries(transcriptResult, videoFps)
-                return@withContext Pair(fallback, "AI analysis completed using semantic rhythmic fallbacks.")
-            }
-
-            val parsedResult = jsonParser.decodeFromString(BoundaryJsonResponse.serializer(), textContent)
-            val cleanBoundaries = parsedResult.boundaries.map { item ->
-                GeminiBoundaryItem(
-                    time = (item.time * 100.0).roundToInt() / 100.0,
-                    reason = item.reason.ifBlank { "Semantic thought completion" },
-                    confidence = item.confidence.coerceIn(0.70f, 0.99f)
-                )
-            }.sortedBy { it.time }
-
-            val result = GeminiAnalysisResult(
-                boundaries = cleanBoundaries,
-                summary = parsedResult.summary.ifBlank { "Detected ${cleanBoundaries.size} natural semantic zoom boundaries." },
-                speechRhythmPace = parsedResult.speechRhythmPace,
-                totalKeyframesSuggested = cleanBoundaries.size * 7
-            )
-
-            Pair(result, null)
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception during Gemini semantic analysis", e)
-            val statusMessage = "AI analysis is temporarily unavailable. Please configure the Gemini API on the server."
-            val fallback = generateAlgorithmicSemanticBoundaries(transcriptResult, videoFps, reasonPrefix = "Semantic Structural Analysis")
-            Pair(fallback, statusMessage)
-        }
-    }
-
-    private fun buildPrompt(transcript: TranscriptResult): String {
-        val wordListDump = transcript.words.take(150).joinToString("\n") { w ->
-            "- \"${w.word}\" [start=${w.start}s, end=${w.end}s, pauseAfter=${w.pauseAfterMs}ms]"
         }
 
-        return """
-            Identify all natural speech, sentence, and semantic thought boundaries for video zoom keyframes.
-            
-            Video Duration: ${transcript.speechDurationSeconds} seconds
-            Full Transcript: "${transcript.fullText}"
-            
-            Word-level timings:
-            $wordListDump
-            
-            Requirements:
-            1. Identify natural phrase/sentence boundaries.
-            2. Each boundary must be formatted as:
-               {
-                 "time": number (seconds),
-                 "reason": string (why this boundary punctuates the speech),
-                 "confidence": number (between 0.75 and 0.99)
-               }
-            3. Closely spaced natural boundaries are allowed. Do NOT impose an arbitrary 2-3 second limit.
-            
-            Return a JSON object:
-            {
-               "summary": "Brief executive analysis of speaker cadence",
-               "speechRhythmPace": "Fast / Natural / Deliberate",
-               "boundaries": [
-                 { "time": 2.45, "reason": "Complete introductory thought and vocal cadence drop", "confidence": 0.94 }
-               ]
-            }
-        """.trimIndent()
+        // If backend returned an error or was unavailable
+        val defaultNotice = "AI analysis is temporarily unavailable. Please configure the Gemini API on the server."
+        val noticeMessage = if (lastErrorMessage?.contains("configure", ignoreCase = true) == true) {
+            lastErrorMessage
+        } else {
+            defaultNotice
+        }
+
+        Log.w(TAG, "Using fallback semantic rhythm: $noticeMessage")
+        val fallback = generateAlgorithmicSemanticBoundaries(
+            transcriptResult,
+            videoFps,
+            reasonPrefix = "Semantic Rhythm Engine"
+        )
+        Pair(fallback, defaultNotice)
     }
 
     fun generateAlgorithmicSemanticBoundaries(
@@ -230,7 +162,7 @@ object GeminiSemanticEngine {
             }
         }
 
-        // If boundaries are still empty or video has no words, create rhythm markers based on duration
+        // If boundaries are still empty, create rhythm markers based on duration
         if (boundaries.isEmpty()) {
             val totalSec = transcriptResult.speechDurationSeconds.coerceAtLeast(3.0)
             var t = 1.8
