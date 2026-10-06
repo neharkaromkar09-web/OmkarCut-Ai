@@ -1,0 +1,6 @@
+{
+  "name": "CutsZoom AI",
+  "description": "Create. Edit. Automate. Professional AI Video Editor with speech-boundary detection and smooth zoom keyframes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
